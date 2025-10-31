@@ -35,14 +35,17 @@ function App() {
     start: new Date('2020-03-01'),
     end: new Date()
   });
-  const [showBackdrop, setShowBackdrop] = useState(false);
+  const [showBackdrop, setShowBackdrop] = useState(true);
   const [highlightEnabled, setHighlightEnabled] = useState(false);
   const [highlightThreshold, setHighlightThreshold] = useState(40);
   const [highlightLookback, setHighlightLookback] = useState(90);
   const [showR0, setShowR0] = useState(false);
   const [r0Window, setR0Window] = useState(21);
   const [r0SI, setR0SI] = useState(4.8);
+  const [showVaccines, setShowVaccines] = useState(false);
+  const [vaccineMetric, setVaccineMetric] = useState('people_fully_vaccinated');
   const [showAbout, setShowAbout] = useState(false);
+  const [trimRecentDays, setTrimRecentDays] = useState(0);
   
   const sidebarRef = useRef(null);
   const [sidebarWidth, setSidebarWidth] = useState(280);
@@ -167,7 +170,24 @@ function App() {
   const countries = useMemo(() => {
     if (!data) return [];
     const unique = [...new Set(data.map(d => d.location || d.country).filter(Boolean))];
-    return unique.sort();
+    
+    // Filter out aggregate entities (continents, income groups, world, etc.)
+    const aggregates = [
+      'World', 'Africa', 'Asia', 'Europe', 'North America', 'South America', 
+      'Oceania', 'European Union', 'High income', 'Low income', 
+      'Lower middle income', 'Upper middle income', 'International',
+      'Antarctica', 'Asia (excl. China and India)', 'Europe (excl. EU)',
+      'European Union (27)', 'South-East Asia'
+    ];
+    
+    // Also filter out locations containing certain keywords
+    const filtered = unique.filter(location => {
+      if (aggregates.includes(location)) return false;
+      // Filter out any location with "income" in the name (catches variations)
+      if (location.toLowerCase().includes('income')) return false;
+      return true;
+    });
+    return filtered.sort();
   }, [data]);
 
   // Filtered countries for dropdown
@@ -204,17 +224,38 @@ function App() {
 
   // Process data for plotting
   const plotData = useMemo(() => {
-    if (!data) return { traces: [], layout: {}, shapes: [], r0Data: [], highlightData: [] };
+    if (!data) return { traces: [], layout: {}, shapes: [], r0Data: [], highlightData: [], dataAvailability: [] };
 
     let filtered = data.filter(d => {
       const date = new Date(d.date);
-      return date >= dateRange.start && date <= dateRange.end;
+      const endDate = new Date(dateRange.end);
+      endDate.setDate(endDate.getDate() - trimRecentDays);
+      return date >= dateRange.start && date <= endDate;
     });
 
     let traces = [];
     let shapes = [];
     let r0Data = [];
     let highlightData = [];
+    let dataAvailability = [];
+    
+    // Check which countries have data for the current metric
+    const countryMetricData = new Map();
+    filtered.forEach(row => {
+      const location = row.location || row.country;
+      const value = parseFloat(row[metric]);
+      if (location && !isNaN(value) && value > 0) {
+        if (!countryMetricData.has(location)) {
+          countryMetricData.set(location, 0);
+        }
+        countryMetricData.set(location, countryMetricData.get(location) + 1);
+      }
+    });
+    
+    // Create availability list sorted by data points
+    dataAvailability = Array.from(countryMetricData.entries())
+      .map(([country, count]) => ({ country, dataPoints: count }))
+      .sort((a, b) => b.dataPoints - a.dataPoints);
     
     if (viewType === 'global') {
       // Aggregate global data
@@ -243,6 +284,23 @@ function App() {
         const worldPop = dates.map(d => dateMap.get(d).pop);
         values = values.map((v, i) => (v / worldPop[i]) * 1e6);
       }
+      
+      // Outlier detection and capping to prevent data artifacts from warping the chart
+      if (values.length > 10) {
+        // Calculate median and IQR for outlier detection
+        const sortedValues = [...values].filter(v => v > 0).sort((a, b) => a - b);
+        if (sortedValues.length > 0) {
+          const q1Index = Math.floor(sortedValues.length * 0.25);
+          const q3Index = Math.floor(sortedValues.length * 0.75);
+          const q1 = sortedValues[q1Index];
+          const q3 = sortedValues[q3Index];
+          const iqr = q3 - q1;
+          const upperBound = q3 + (3 * iqr); // 3x IQR for extreme outliers
+          
+          // Cap extreme outliers (but keep the general trend)
+          values = values.map(v => v > upperBound ? upperBound : v);
+        }
+      }
 
       // Filter out zeros and negatives for log scale
       const filteredData = dates.map((d, i) => ({ date: d, value: values[i] }))
@@ -257,6 +315,80 @@ function App() {
         line: { color: COLOR_PALETTE[0], width: 3 },
         hovertemplate: '<b>Global</b><br>Date: %{x}<br>Value: %{y:,.0f}<extra></extra>'
       });
+      
+      // Add backdrop if enabled for global view
+      if (showBackdrop) {
+        const globalMax = Math.max(...filteredData.map(d => d.value).filter(v => isFinite(v)));
+        const globalMin = Math.min(...filteredData.map(d => d.value).filter(v => isFinite(v) && v > 0));
+        
+        const allCountries = countries.slice(0, 150);
+        const backdropTraces = [];
+        
+        allCountries.forEach(country => {
+          const countryData = filtered.filter(d => 
+            (d.location || d.country) === country
+          ).sort((a, b) => a.date.localeCompare(b.date));
+
+          if (countryData.length === 0) return;
+
+          let values = countryData.map(d => parseFloat(d[metric]) || 0);
+          const pop = parseFloat(countryData[0].population) || 1;
+
+          if (metric.includes('new_')) {
+            values = rollingAverage(values, smoothing);
+          }
+
+          // Normalize to per million to match global line
+          values = values.map(v => (v / pop) * 1e6);
+
+          const dates = countryData.map(d => d.date);
+          
+          // Apply outlier capping to prevent data artifacts
+          if (values.length > 10) {
+            const sortedValues = [...values].filter(v => v > 0).sort((a, b) => a - b);
+            if (sortedValues.length > 0) {
+              const q3Index = Math.floor(sortedValues.length * 0.75);
+              const q3 = sortedValues[q3Index];
+              const median = sortedValues[Math.floor(sortedValues.length * 0.5)];
+              const iqr = q3 - median;
+              const upperBound = q3 + (5 * iqr); // Cap extreme outliers
+              
+              // Cap values that are extreme outliers
+              values = values.map(v => v > upperBound ? upperBound : v);
+            }
+          }
+          
+          const countryFilteredData = dates.map((d, i) => ({ date: d, value: values[i] }))
+            .filter(d => d.value > 0 || !logScale);
+
+          const countryMax = Math.max(...countryFilteredData.map(d => d.value).filter(v => isFinite(v)));
+          const countryMedian = countryFilteredData.length > 0 
+            ? countryFilteredData.map(d => d.value).sort((a,b) => a-b)[Math.floor(countryFilteredData.length/2)]
+            : 0;
+          
+          // Filter out countries with extreme outliers that warp the scale
+          // Keep countries that have reasonable max values relative to global
+          if (countryFilteredData.length > 20 && 
+              isFinite(countryMax) && 
+              countryMax > 0 && 
+              countryMax <= globalMax * 1000 &&
+              countryMedian > 0) {
+            backdropTraces.push({
+              x: countryFilteredData.map(d => d.date),
+              y: countryFilteredData.map(d => d.value),
+              type: 'scatter',
+              mode: 'lines',
+              name: country,
+              line: { color: 'rgba(0,0,0,0.08)', width: 0.5 },
+              showlegend: false,
+              hoverinfo: 'skip'
+            });
+          }
+        });
+        
+        // Add backdrop traces first (so they appear behind)
+        traces = [...backdropTraces, ...traces];
+      }
 
     } else if (viewType === 'countries' && selectedCountries.length > 0) {
       // Individual country traces
@@ -404,6 +536,52 @@ function App() {
           });
         });
       }
+      
+      // Add global average line when in countries view
+      if (viewType === 'countries') {
+        // Calculate global aggregate
+        const globalDateMap = new Map();
+        filtered.forEach(row => {
+          const date = row.date;
+          const value = parseFloat(row[metric]) || 0;
+          const pop = parseFloat(row.population) || 1;
+          
+          if (!globalDateMap.has(date)) {
+            globalDateMap.set(date, { value: 0, pop: 0 });
+          }
+          const current = globalDateMap.get(date);
+          current.value += value;
+          current.pop += pop;
+        });
+
+        const globalDates = Array.from(globalDateMap.keys()).sort();
+        let globalValues = globalDates.map(d => globalDateMap.get(d).value);
+        
+        if (metric.includes('new_')) {
+          globalValues = rollingAverage(globalValues, smoothing);
+        }
+        
+        // Normalize to per million if perCapita is enabled
+        if (perCapita) {
+          const worldPop = globalDates.map(d => globalDateMap.get(d).pop);
+          globalValues = globalValues.map((v, i) => (v / worldPop[i]) * 1e6);
+        }
+
+        const filteredGlobalData = globalDates.map((d, i) => ({ date: d, value: globalValues[i] }))
+          .filter(d => d.value > 0 || !logScale);
+
+        if (filteredGlobalData.length > 0) {
+          traces.push({
+            x: filteredGlobalData.map(d => d.date),
+            y: filteredGlobalData.map(d => d.value),
+            type: 'scatter',
+            mode: 'lines',
+            name: 'Global Average',
+            line: { color: '#94a3b8', width: 2, dash: 'dot' },
+            hovertemplate: '<b>Global Average</b><br>Date: %{x}<br>Value: %{y:,.0f}<extra></extra>'
+          });
+        }
+      }
 
       // Add backdrop if enabled
       if (showBackdrop) {
@@ -433,22 +611,44 @@ function App() {
           }
 
           const dates = countryData.map(d => d.date);
+          
+          // Apply outlier capping to prevent data artifacts
+          if (values.length > 10) {
+            const sortedValues = [...values].filter(v => v > 0).sort((a, b) => a - b);
+            if (sortedValues.length > 0) {
+              const q3Index = Math.floor(sortedValues.length * 0.75);
+              const q3 = sortedValues[q3Index];
+              const median = sortedValues[Math.floor(sortedValues.length * 0.5)];
+              const iqr = q3 - median;
+              const upperBound = q3 + (5 * iqr); // Cap extreme outliers
+              
+              // Cap values that are extreme outliers
+              values = values.map(v => v > upperBound ? upperBound : v);
+            }
+          }
+          
           const filteredData = dates.map((d, i) => ({ date: d, value: values[i] }))
             .filter(d => d.value > 0 || !logScale);
 
           // Calculate max for this country
           const countryMax = Math.max(...filteredData.map(d => d.value).filter(v => isFinite(v)));
+          const countryMedian = filteredData.length > 0 
+            ? filteredData.map(d => d.value).sort((a,b) => a-b)[Math.floor(filteredData.length/2)]
+            : 0;
           
-          // Only include backdrop countries within 100x of selected countries' range
-          // This prevents extreme outliers from warping the scale
-          if (countryMax <= selectedMax * 100 && countryMax >= selectedMin / 100) {
+          // Include countries with reasonable data (filter out extreme outliers)
+          if (filteredData.length > 20 && 
+              isFinite(countryMax) && 
+              countryMax > 0 &&
+              countryMax <= selectedMax * 1000 &&
+              countryMedian > 0) {
             backdropTraces.push({
               x: filteredData.map(d => d.date),
               y: filteredData.map(d => d.value),
               type: 'scatter',
               mode: 'lines',
               name: country,
-              line: { color: 'rgba(0,0,0,0.03)', width: 0.5 },
+              line: { color: 'rgba(0,0,0,0.08)', width: 0.5 },
               showlegend: false,
               hoverinfo: 'skip'
             });
@@ -461,72 +661,97 @@ function App() {
     }
 
     const metricLabel = {
-      'total_cases': 'Total cases',
-      'new_cases': 'New cases',
-      'total_deaths': 'Total deaths',
-      'new_deaths': 'New deaths'
+      'total_cases': 'Total Cases',
+      'new_cases': 'New Cases',
+      'total_deaths': 'Total Deaths',
+      'new_deaths': 'New Deaths'
     }[metric] || 'Value';
 
     const yAxisTitle = perCapita ? `${metricLabel} (per million)` : metricLabel;
     
-    // Create plot title
-    let plotTitle = '';
+    // Create improved plot title with main title and subtitle
+    let mainTitle = '';
+    let subtitle = '';
+    
     if (viewType === 'global') {
-      plotTitle = `Global ${metricLabel}`;
+      mainTitle = `Global ${metricLabel}`;
     } else if (selectedCountries.length > 0) {
-      plotTitle = `${metricLabel} - ${selectedCountries.join(', ')}`;
+      mainTitle = metricLabel;
+      if (selectedCountries.length <= 3) {
+        subtitle = selectedCountries.join(', ');
+      } else {
+        subtitle = `${selectedCountries.slice(0, 3).join(', ')} +${selectedCountries.length - 3} more`;
+      }
     }
+    
+    // Add parameters to subtitle
+    const params = [];
     if (metric.includes('new_') && smoothing > 1) {
-      plotTitle += ` (${smoothing}-day average)`;
+      params.push(`${smoothing}-day average`);
     }
     if (perCapita) {
-      plotTitle += ' [per million]';
+      params.push('per million');
     }
     if (logScale) {
-      plotTitle += ' [log scale]';
+      params.push('log scale');
+    }
+    if (params.length > 0) {
+      subtitle = subtitle ? `${subtitle} • ${params.join(' • ')}` : params.join(' • ');
     }
 
-    // Better y-axis configuration
+    // Better y-axis configuration with clearer formatting
     const yAxisConfig = {
-      title: yAxisTitle,
       type: logScale ? 'log' : 'linear',
-      gridcolor: '#e5e7e5',
+      gridcolor: '#e5e7eb',
       showgrid: true,
       automargin: true,
-      side: 'left'
+      side: 'left',
+      exponentformat: 'none',
+      separatethousands: true
     };
 
     if (logScale) {
-      // For log scale, force specific tick values for clean display
-      yAxisConfig.tickmode = 'array';
-      yAxisConfig.tickformat = '.3s';
-      yAxisConfig.exponentformat = 'none';
-      // Will show: 1k, 10k, 100k, 1M, 10M, etc.
+      // For log scale with custom formatting to avoid confusion
+      // Use SI notation but format it properly
+      yAxisConfig.dtick = 1;  // One tick per power of 10
+      yAxisConfig.tickformat = '~s'; // Clean SI format (k, M, G)
+      yAxisConfig.tickmode = 'auto';
     } else {
       // For linear scale
-      yAxisConfig.tickformat = '.3s';
-      yAxisConfig.separatethousands = true;
+      yAxisConfig.tickformat = '~s';
     }
 
     const layout = {
       title: {
-        text: plotTitle,
-        font: { size: 14, color: '#374151' },
-        x: 0.5,
-        xanchor: 'center'
+        text: `<b>${mainTitle}</b><br><span style="font-size:11px;color:#6b7280">${subtitle}</span>`,
+        font: { size: 16, color: '#111827' },
+        x: 0.02,
+        xanchor: 'left',
+        y: 0.96,
+        yanchor: 'top',
+        pad: { t: 10, b: 10 }
       },
       xaxis: {
-        title: 'Date',
-        gridcolor: '#e5e7e5',
+        title: {
+          text: 'Date',
+          font: { size: 12 }
+        },
+        gridcolor: '#e5e7eb',
         showgrid: true,
         automargin: true
       },
-      yaxis: yAxisConfig,
+      yaxis: {
+        ...yAxisConfig,
+        title: {
+          text: yAxisTitle,
+          font: { size: 12 }
+        }
+      },
       hovermode: 'closest',
       plot_bgcolor: '#ffffff',
       paper_bgcolor: '#ffffff',
       font: { family: 'Inter, sans-serif', size: 12, color: '#333' },
-      margin: { l: 60, r: 20, t: 20, b: 60 },
+      margin: { l: 70, r: 70, t: 110, b: 60 },
       autosize: true,
       legend: {
         orientation: 'h',
@@ -543,9 +768,111 @@ function App() {
       },
       shapes: shapes
     };
+    
+    // Add vaccination data if enabled
+    if (showVaccines) {
+      if (viewType === 'global') {
+        // Global vaccine aggregation
+        const vaccineDateMap = new Map();
+        filtered.forEach(row => {
+          const date = row.date;
+          const value = parseFloat(row[vaccineMetric]) || 0;
+          const pop = parseFloat(row.population) || 1;
+          
+          if (!vaccineDateMap.has(date)) {
+            vaccineDateMap.set(date, { value: 0, pop: 0 });
+          }
+          const current = vaccineDateMap.get(date);
+          current.value += value;
+          current.pop += pop;
+        });
 
-    return { traces, layout, r0Data, highlightData };
-  }, [data, viewType, selectedCountries, metric, perCapita, logScale, smoothing, dateRange, showBackdrop, countries, highlightEnabled, highlightThreshold, highlightLookback, showR0, r0Window, r0SI]);
+        const dates = Array.from(vaccineDateMap.keys()).sort();
+        const worldPop = dates.map(d => vaccineDateMap.get(d).pop);
+        let values = dates.map((d, i) => {
+          const vaccineCount = vaccineDateMap.get(d).value;
+          const totalPop = worldPop[i];
+          return (vaccineCount / totalPop) * 100; // Convert to percentage
+        });
+
+        const filteredVaccineData = dates.map((d, i) => ({ date: d, value: values[i] }))
+          .filter(d => d.value > 0);
+
+        if (filteredVaccineData.length > 0) {
+          traces.push({
+            x: filteredVaccineData.map(d => d.date),
+            y: filteredVaccineData.map(d => d.value),
+            type: 'scatter',
+            mode: 'lines',
+            name: 'Vaccinations (Global)',
+            line: { color: '#10b981', width: 2, dash: 'dash' },
+            yaxis: 'y2',
+            hovertemplate: '<b>Vaccinations</b><br>Date: %{x}<br>Value: %{y:.1f}%<extra></extra>'
+          });
+          
+          // Add second y-axis for vaccines
+          layout.yaxis2 = {
+            title: '% of Population Vaccinated',
+            overlaying: 'y',
+            side: 'right',
+            showgrid: false,
+            tickformat: '.0f',
+            ticksuffix: '%',
+            range: vaccineMetric === 'total_vaccinations' ? [0, 300] : [0, 100],
+            fixedrange: false
+          };
+        }
+      } else if (viewType === 'countries' && selectedCountries.length > 0) {
+        // Individual country vaccine traces
+        selectedCountries.forEach((country, idx) => {
+          const countryData = filtered.filter(d => 
+            (d.location || d.country) === country
+          ).sort((a, b) => a.date.localeCompare(b.date));
+
+          if (countryData.length === 0) return;
+
+          const pop = parseFloat(countryData[0].population) || 1;
+          let values = countryData.map(d => {
+            const vaccineCount = parseFloat(d[vaccineMetric]) || 0;
+            return (vaccineCount / pop) * 100; // Convert to percentage
+          });
+
+          const dates = countryData.map(d => d.date);
+          const filteredVaccineData = dates.map((d, i) => ({ date: d, value: values[i] }))
+            .filter(d => d.value > 0);
+
+          if (filteredVaccineData.length > 0) {
+            traces.push({
+              x: filteredVaccineData.map(d => d.date),
+              y: filteredVaccineData.map(d => d.value),
+              type: 'scatter',
+              mode: 'lines',
+              name: `${country} (Vaccines)`,
+              line: { color: COLOR_PALETTE[idx % COLOR_PALETTE.length], width: 1.5, dash: 'dash' },
+              yaxis: 'y2',
+              hovertemplate: `<b>${country} (Vaccines)</b><br>Date: %{x}<br>Value: %{y:.1f}%<extra></extra>`
+            });
+          }
+        });
+        
+        // Add second y-axis for vaccines if any vaccine data was added
+        if (traces.some(t => t.yaxis === 'y2')) {
+          layout.yaxis2 = {
+            title: '% of Population Vaccinated',
+            overlaying: 'y',
+            side: 'right',
+            showgrid: false,
+            tickformat: '.0f',
+            ticksuffix: '%',
+            range: vaccineMetric === 'total_vaccinations' ? [0, 300] : [0, 100],
+            fixedrange: false
+          };
+        }
+      }
+    }
+
+    return { traces, layout, r0Data, highlightData, dataAvailability };
+  }, [data, viewType, selectedCountries, metric, perCapita, logScale, smoothing, dateRange, showBackdrop, countries, highlightEnabled, highlightThreshold, highlightLookback, showR0, r0Window, r0SI, trimRecentDays, showVaccines, vaccineMetric]);
 
   if (loading) {
     return (
@@ -566,7 +893,7 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       <header className="header">
         <div className="header-content">
           <div className="header-left">
@@ -620,7 +947,7 @@ function App() {
         </div>
       )}
 
-      <div className="main-content">
+      <div className="main-content" style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'row', minHeight: 0 }}>
         <aside className="sidebar" ref={sidebarRef} style={{ width: `${sidebarWidth}px` }}>
           <div className="control-section">
             <h3>View Settings</h3>
@@ -681,7 +1008,11 @@ function App() {
                     ))}
                   </div>
                 )}
-                
+              </div>
+            )}
+            
+            {(viewType === 'countries' || viewType === 'global') && (
+              <div className="control-group">
                 <label className="checkbox-label">
                   <input
                     type="checkbox"
@@ -737,6 +1068,22 @@ function App() {
                 </label>
               </div>
             </div>
+            
+            {plotData.dataAvailability && plotData.dataAvailability.length > 0 && (
+              <div className="control-group">
+                <details className="data-availability">
+                  <summary>
+                    <small>📊 Data availability: {plotData.dataAvailability.length} countries have data for this metric</small>
+                  </summary>
+                  <div className="availability-list">
+                    <small>
+                      {plotData.dataAvailability.slice(0, 20).map(item => item.country).join(', ')}
+                      {plotData.dataAvailability.length > 20 && ` ... and ${plotData.dataAvailability.length - 20} more`}
+                    </small>
+                  </div>
+                </details>
+              </div>
+            )}
 
             <div className="control-group">
               <label className="checkbox-label">
@@ -815,6 +1162,24 @@ function App() {
               </div>
             </div>
           )}
+
+          <div className="control-section">
+            <h3>Data Quality</h3>
+            <div className="control-group">
+              <label htmlFor="trim-days">Exclude last {trimRecentDays} days</label>
+              <small>Remove incomplete recent data that may cause spikes</small>
+              <input
+                id="trim-days"
+                type="range"
+                min="0"
+                max="30"
+                step="1"
+                value={trimRecentDays}
+                onChange={(e) => setTrimRecentDays(parseInt(e.target.value))}
+                className="slider"
+              />
+            </div>
+          </div>
 
           <div className="control-section">
             <h3>Highlight Rises</h3>
@@ -904,12 +1269,67 @@ function App() {
               )}
             </div>
           </div>
+
+          <div className="control-section">
+            <h3>Vaccination Data</h3>
+            <div className="control-group">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={showVaccines}
+                  onChange={(e) => setShowVaccines(e.target.checked)}
+                />
+                <span>Show vaccination overlay</span>
+              </label>
+              <small>Display vaccination rates on chart</small>
+              
+              {showVaccines && (
+                <>
+                  <label>Vaccine Metric</label>
+                  <div className="radio-group">
+                    <label className="radio-label">
+                      <input
+                        type="radio"
+                        value="people_vaccinated"
+                        checked={vaccineMetric === 'people_vaccinated'}
+                        onChange={(e) => setVaccineMetric(e.target.value)}
+                      />
+                      <span>≥1 dose</span>
+                    </label>
+                    <label className="radio-label">
+                      <input
+                        type="radio"
+                        value="people_fully_vaccinated"
+                        checked={vaccineMetric === 'people_fully_vaccinated'}
+                        onChange={(e) => setVaccineMetric(e.target.value)}
+                      />
+                      <span>Fully vaccinated</span>
+                    </label>
+                    <label className="radio-label">
+                      <input
+                        type="radio"
+                        value="total_vaccinations"
+                        checked={vaccineMetric === 'total_vaccinations'}
+                        onChange={(e) => setVaccineMetric(e.target.value)}
+                      />
+                      <span>Total doses*</span>
+                    </label>
+                  </div>
+                  {vaccineMetric === 'total_vaccinations' && (
+                    <small style={{marginTop: '4px', display: 'block', fontStyle: 'italic', color: '#6b7280'}}>
+                      *Total doses counts all shots given (1st + 2nd + boosters), so 200% means on average everyone got 2 doses
+                    </small>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
           
           <div className="resize-handle"></div>
         </aside>
 
-        <main className="chart-area">
-          <div className="chart-container">
+        <main className="chart-area" style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', overflow: 'auto', minHeight: 0 }}>
+          <div className="chart-container" style={{ height: 'clamp(400px, 50vh, 600px)', flexShrink: 0 }}>
             {plotData.traces.length > 0 ? (
               <Plot
                 data={plotData.traces}
@@ -930,6 +1350,19 @@ function App() {
             )}
           </div>
           
+          {/* Figure legend explaining abbreviations */}
+          {plotData.traces.length > 0 && (
+            <div style={{ 
+              padding: '8px 12px', 
+              fontSize: '11px', 
+              color: '#9ca3af', 
+              borderTop: '1px solid #e5e7eb',
+              fontStyle: 'italic'
+            }}>
+              Axis abbreviations: k = thousand, M = million, G = billion, m = milli (1/1000)
+            </div>
+          )}
+          
           {showR0 && plotData.r0Data && plotData.r0Data.length > 0 && (
             <div className="data-table-container">
               <h4>R₀ Estimates (Last {r0Window} days)</h4>
@@ -949,6 +1382,39 @@ function App() {
                       <td>{row.doublingHalving}</td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          
+          {showVaccines && plotData.vaccineData && plotData.vaccineData.length > 0 && (
+            <div className="data-table-container">
+              <h4>Vaccination Data</h4>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Location</th>
+                    <th>Latest Value</th>
+                    <th>Data Points Available</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {plotData.vaccineData.map(item => {
+                    const latest = item.values[item.values.length - 1];
+                    const latestDate = item.dates[item.dates.length - 1];
+                    return (
+                      <tr key={item.country}>
+                        <td><strong>{item.country}</strong></td>
+                        <td>
+                          {latest.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                          {perCapita && ' per million'}
+                          <br />
+                          <small style={{ color: '#6b7280' }}>as of {latestDate}</small>
+                        </td>
+                        <td>{item.dataPoints} data points</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
