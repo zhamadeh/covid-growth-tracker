@@ -893,7 +893,7 @@ function App() {
   }
 
   return (
-    <div className="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+    <div className="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
       <header className="header">
         <div className="header-content">
           <div className="header-left">
